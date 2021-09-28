@@ -14,8 +14,10 @@ import (
 )
 
 var (
-	ErrAlreadyLocked = errors.New("Already locked")
-	ErrNotLocked     = errors.New("Not locked")
+	ErrAlreadyLocked                 = errors.New("Already locked")
+	ErrNotLocked                     = errors.New("Not locked")
+	ErrLockObjectChangedUnexpectedly = errors.New("Lock object has an unexpected metageneration number")
+	ErrLockObjectDeletedUnexpectedly = errors.New("Lock object has been unexpectedly deleted")
 
 	defaultInstanceIdentityPrefixWithoutPid = randstr.Hex(12)
 )
@@ -81,7 +83,7 @@ func New(ctx context.Context, config Config) (*Lock, error) {
 
 func (l *Lock) Lock(opts LockOptions) (UnlockFunc, error) {
 	if opts.Context == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), l.config.TTL)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*l.config.TTL)
 		defer cancel()
 		opts.Context = ctx
 	}

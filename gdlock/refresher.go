@@ -2,7 +2,6 @@ package gdlock
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"time"
 
@@ -80,10 +79,10 @@ func (l *Lock) refreshLock(ctx context.Context, refresherGeneration uint64) (res
 	if err != nil {
 		if gerr, ok := err.(*googleapi.Error); ok {
 			if gerr.Code == 412 {
-				err = errors.New("Lock object has an unexpected metageneration number")
+				err = ErrLockObjectChangedUnexpectedly
 				permanentFailure = true
 			} else if gerr.Code == 404 {
-				err = errors.New("Lock object has been unexpectedly deleted")
+				err = ErrLockObjectDeletedUnexpectedly
 				permanentFailure = true
 			}
 		}
