@@ -2,18 +2,42 @@ package gdlock
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/thanhpk/randstr"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
+var (
+	ErrAlreadyLocked = errors.New("Already locked")
+	ErrNotLocked     = errors.New("Not locked")
+
+	defaultInstanceIdentityPrefixWithoutPid = randstr.Hex(12)
+)
+
 type Lock struct {
-	config     Config
-	bucket     *storage.BucketHandle
-	stateMutex sync.Mutex
+	config Config
+	bucket *storage.BucketHandle
+
+	/****** Read-write variables protected by stateMutex ******/
+
+	stateMutex         sync.Mutex
+	owner              string
+	metageneration     int64
+	refresherCanceller context.CancelFunc
+	refresherWaiter    *sync.WaitGroup
+	refresherError     error
+
+	// The refresher generation is incremented every time we shutdown
+	// the refresher goroutine. It allows the refresher thread to know
+	// whether it's being shut down (and thus shouldn't access/modify
+	// state).
+	refresherGeneration uint64
 }
 
 type Config struct {
@@ -33,10 +57,10 @@ type Config struct {
 
 type LockOptions struct {
 	Context     context.Context
-	GoroutineID uint
+	GoroutineID uint64
 }
 
-type UnlockFunc = func() error
+type UnlockFunc = func() (deleted bool, err error)
 
 func New(ctx context.Context, config Config) (*Lock, error) {
 	client, err := createClientHandle(ctx, config)
@@ -62,14 +86,146 @@ func (l *Lock) Lock(opts LockOptions) (UnlockFunc, error) {
 		opts.Context = ctx
 	}
 
-	unlocker := func() error {
-		return l.unlock(opts)
+	if l.OwnedAccordingToInternalState(opts.GoroutineID) {
+		return nil, ErrAlreadyLocked
 	}
+
+	var (
+		file  *storage.ObjectHandle
+		attrs *storage.ObjectAttrs
+		err   error
+	)
+	var retryOpts = retryOptions{
+		RetryLogger: func(sleepDuration time.Duration) {
+			l.logInfo("Unable to acquire lock. Will try again in %.1f seconds", sleepDuration)
+		},
+		BackoffMin:        l.config.BackoffMin,
+		BackoffMax:        l.config.BackoffMax,
+		BackoffMultiplier: l.config.BackoffMultiplier,
+	}
+
+	err = retryWithBackoffUntilSuccess(retryOpts, func() (tryResult, error) {
+		l.logDebug("Acquiring lock")
+		file, err = l.createLockObject(opts.Context, opts.GoroutineID)
+		if err != nil {
+			return tryResultError, err
+		}
+		if file != nil {
+			l.logDebug("Successfully acquired lock")
+			return tryResultSuccess, nil
+		}
+
+		l.logDebug("Error acquiring lock. Investigating why...")
+		file = l.bucket.Object(l.config.Path)
+		attrs, err = file.Attrs(opts.Context)
+		if err == storage.ErrObjectNotExist {
+			l.logWarn("Lock was deleted right after having created it. Retrying.")
+			return tryResultRetryImmediately, nil
+		}
+		if err != nil {
+			return tryResultError, err
+		}
+
+		if attrs.Metadata["identity"] == l.identity(opts.GoroutineID) {
+			l.logWarn("Lock was already owned by this instance, but was abandoned. Resetting lock")
+			_, err = l.deleteLockObject(opts.Context, attrs.Metageneration)
+			return tryResultRetryImmediately, err
+		}
+
+		if l.isLockStale(attrs) {
+			l.logWarn("Lock is stale. Resetting lock")
+			_, err = l.deleteLockObject(opts.Context, attrs.Metageneration)
+		} else {
+			l.logDebug("Lock was already acquired, and is not stale")
+		}
+		return tryResultError, err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	refresherGeneration := l.initializeLockedState(opts, attrs)
+	l.logDebug("Locked. refresher_generation=%v, metageneration=%v", refresherGeneration, attrs.Metageneration)
+
+	unlocker := func() (bool, error) { return l.unlock(opts) }
 	return unlocker, nil
 }
 
-func (l *Lock) unlock(opts LockOptions) error {
+func (l *Lock) unlock(opts LockOptions) (deleted bool, err error) {
+	unlockStateMutex := lockMutex(&l.stateMutex)
+	defer unlockStateMutex()
 
+	if !l.lockedAccordingToInternalState() {
+		return false, ErrNotLocked
+	}
+
+	refresherGeneration := l.refresherGeneration
+	waiter := l.shutdownRefresherGoroutine()
+	metageneration := l.metageneration
+
+	l.owner = ""
+	l.metageneration = 0
+	unlockStateMutex()
+
+	waiter.Wait()
+	result, err := l.deleteLockObject(opts.Context, metageneration)
+	if err != nil {
+		l.logDebug("Unlocked. refresher_generation=%v, metageneration=%v", refresherGeneration, metageneration)
+	}
+	return result, err
+}
+
+func (l *Lock) initializeLockedState(opts LockOptions, attrs *storage.ObjectAttrs) uint64 {
+	l.stateMutex.Lock()
+	defer l.stateMutex.Unlock()
+
+	l.owner = l.identity(opts.GoroutineID)
+	l.metageneration = attrs.Metageneration
+	l.spawnRefresherThread()
+	return l.refresherGeneration
+}
+
+// createLockObject creates the lock object in Cloud Storage. Returns the object handle
+// on success, nil if object already exists, or an error when any other error occurs.
+func (l *Lock) createLockObject(ctx context.Context, goroutineID uint64) (*storage.ObjectHandle, error) {
+	object := l.bucket.
+		Object(l.config.Path).
+		If(storage.Conditions{DoesNotExist: true})
+	writer := object.NewWriter(ctx)
+	writer.ObjectAttrs.CacheControl = "no-store"
+	writer.ObjectAttrs.Metadata = map[string]string{
+		"expires_at": l.ttlTimestampString(),
+		"identity":   l.identity(goroutineID),
+	}
+
+	err := writer.Close()
+	if err != nil {
+		gerr, isGoogleAPIError := err.(*googleapi.Error)
+		if isGoogleAPIError && gerr.Code == 412 {
+			return nil, nil
+		} else {
+			return nil, err
+		}
+	} else {
+		return object, nil
+	}
+}
+
+func (l *Lock) deleteLockObject(ctx context.Context, expectedMetageneration int64) (bool, error) {
+	object := l.bucket.
+		Object(l.config.Path).
+		If(storage.Conditions{MetagenerationMatch: expectedMetageneration})
+	err := object.Delete(ctx)
+	if err != nil {
+		gerr, isGoogleAPIError := err.(*googleapi.Error)
+		if isGoogleAPIError && (gerr.Code == 404 || gerr.Code == 412) {
+			return false, nil
+		} else {
+			return false, err
+		}
+	} else {
+		return true, nil
+	}
 }
 
 func createClientHandle(ctx context.Context, config Config) (*storage.Client, error) {

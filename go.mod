@@ -4,5 +4,6 @@ go 1.15
 
 require (
 	cloud.google.com/go/storage v1.16.1
+	github.com/thanhpk/randstr v1.0.4
 	google.golang.org/api v0.54.0
 )
