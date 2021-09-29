@@ -2,7 +2,6 @@ package gdlock
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -10,35 +9,34 @@ import (
 )
 
 func (l *Lock) spawnRefresherThread() {
-	ctx, cancel := context.WithCancel(context.Background())
-	l.refresherWaiter = &sync.WaitGroup{}
-	l.refresherCanceller = cancel
-	l.refresherWaiter.Add(1)
-	go l.refresherGoroutineMain(ctx, l.refresherWaiter, l.refresherGeneration)
+	abortionContext, abort := context.WithCancel(context.Background())
+	waitContext, done := context.WithCancel(context.Background())
+	l.refresherWaitContext = waitContext
+	l.refresherAbort = abort
+	go l.refresherGoroutineMain(abortionContext, done, l.refresherGeneration)
 }
 
-// shutdownRefresherGoroutine Cancels the refresher goroutine, but does not wait for it to finish shutting down.
-// Use the returned WaitGroup to wait.
-func (l *Lock) shutdownRefresherGoroutine() *sync.WaitGroup {
-	waiter := l.refresherWaiter
-	l.refresherCanceller()
-	l.refresherCanceller = nil
+// shutdownRefresherGoroutine aborts the refresher goroutine, but does not wait for it to finish shutting down.
+// Use a Context on which one can wait for the shutting down to finish.
+func (l *Lock) shutdownRefresherGoroutine() context.Context {
+	waiter := l.refresherWaitContext
+	l.refresherWaitContext = nil
+	l.refresherAbort()
+	l.refresherAbort = nil
 	l.refresherGeneration++
-	l.refresherWaiter = nil
 	return waiter
 }
 
-func (l *Lock) refresherGoroutineMain(ctx context.Context, waiter *sync.WaitGroup, refresherGeneration uint64) {
+func (l *Lock) refresherGoroutineMain(ctx context.Context, done context.CancelFunc, refresherGeneration uint64) {
 	defer func() {
 		l.logDebug("Exiting refresher goroutine")
-		waiter.Done()
+		done()
 	}()
 
 	opts := workRegularlyOptions{
-		Mutex:           &l.stateMutex,
-		Context:         ctx,
-		RefreshInterval: l.config.RefreshInterval,
-		MaxFailures:     l.config.MaxRefreshFails,
+		Context:     ctx,
+		Interval:    l.config.RefreshInterval,
+		MaxFailures: l.config.MaxRefreshFails,
 		ScheduleCalculatedFunc: func(timeout time.Duration) {
 			l.logDebug("Next lock refresh in %.1fs", float64(timeout)/1000000000)
 		},
@@ -104,25 +102,9 @@ func (l *Lock) refreshLock(ctx context.Context, refresherGeneration uint64) (res
 		l.logDebug("Abort refreshing lock")
 		return true, false
 	}
-	metageneration = l.metageneration
+	l.metageneration = attrs.Metageneration
 	unlockStateMutex()
 
 	l.logDebug("Done refreshing lock. metageneration=%v", attrs.Metageneration)
 	return true, false
-}
-
-func (l *Lock) handleRefreshLockError(err error, refresherGeneration uint64, permanentFailure bool) (bool, bool) {
-	unlockStateMutex := lockMutex(&l.stateMutex)
-	defer unlockStateMutex()
-
-	if l.refresherGeneration != refresherGeneration {
-		l.logDebug("Abort refreshing lock")
-		return true, false
-	}
-
-	l.refresherError = err
-	unlockStateMutex()
-
-	l.logError("Error refreshing lock: %s", err.Error())
-	return false, permanentFailure
 }

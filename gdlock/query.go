@@ -46,13 +46,13 @@ func (l *Lock) identity(goroutineID uint64) string {
 		result = l.config.InstanceIdentityPrefix
 	}
 	if goroutineID != 0 {
-		result += fmt.Sprintf("/thr-%s", goroutineID)
+		result += fmt.Sprintf("/thr-%d", goroutineID)
 	}
 	return result
 }
 
 func (l *Lock) ttlTimestampString() string {
-	return fmt.Sprintf("%f", time.Now().Add(l.config.TTL).UnixMilli()/1000)
+	return fmt.Sprintf("%f", float64(time.Now().Add(l.config.TTL).UnixMilli())/1000)
 }
 
 func defaultInstanceIdentityPrefix() string {
