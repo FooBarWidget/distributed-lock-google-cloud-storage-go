@@ -2,6 +2,7 @@ package gdlock
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -11,24 +12,30 @@ import (
 func (l *Lock) spawnRefresherThread() {
 	abortionContext, abort := context.WithCancel(context.Background())
 	waitContext, done := context.WithCancel(context.Background())
-	l.refresherWaitContext = waitContext
+	l.refresherWaiter = waitContext
 	l.refresherAbort = abort
-	go l.refresherGoroutineMain(abortionContext, done, l.refresherGeneration)
+
+	var alive uint32 = 1
+	l.refresherLiveState = &alive
+
+	go l.refresherGoroutineMain(abortionContext, done, l.refresherLiveState, l.refresherGeneration)
 }
 
 // shutdownRefresherGoroutine aborts the refresher goroutine, but does not wait for it to finish shutting down.
 // Use a Context on which one can wait for the shutting down to finish.
 func (l *Lock) shutdownRefresherGoroutine() context.Context {
-	waiter := l.refresherWaitContext
-	l.refresherWaitContext = nil
+	waiter := l.refresherWaiter
+	l.refresherWaiter = nil
 	l.refresherAbort()
 	l.refresherAbort = nil
+	l.refresherLiveState = nil
 	l.refresherGeneration++
 	return waiter
 }
 
-func (l *Lock) refresherGoroutineMain(ctx context.Context, done context.CancelFunc, refresherGeneration uint64) {
+func (l *Lock) refresherGoroutineMain(ctx context.Context, done context.CancelFunc, refresherLiveState *uint32, refresherGeneration uint64) {
 	defer func() {
+		atomic.StoreUint32(refresherLiveState, 0)
 		l.logDebug("Exiting refresher goroutine")
 		done()
 	}()

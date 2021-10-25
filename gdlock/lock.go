@@ -20,12 +20,13 @@ type Lock struct {
 
 	/****** Read-write variables protected by stateMutex ******/
 
-	stateMutex           sync.Mutex
-	owner                string
-	metageneration       int64
-	refresherWaitContext context.Context
-	refresherAbort       context.CancelFunc
-	refresherError       error
+	stateMutex         sync.Mutex
+	owner              string
+	metageneration     int64
+	refresherWaiter    context.Context
+	refresherAbort     context.CancelFunc
+	refresherLiveState *uint32
+	refresherError     error
 
 	// refresherGeneration is incremented every time we shutdown
 	// the refresher goroutine. It allows the refresher thread to know
@@ -141,7 +142,7 @@ func (l *Lock) Lock(opts LockOptions) (UnlockFunc, error) {
 		l.logDebug("Error acquiring lock. Investigating why...")
 		file = l.bucket.Object(l.config.Path)
 		attrs, err = file.Attrs(opts.Context)
-		if err == storage.ErrObjectNotExist {
+		if (err != nil && attrs == nil) || err == storage.ErrObjectNotExist {
 			l.logWarn("Lock was deleted right after having created it. Retrying.")
 			return tryResultRetryImmediately, nil
 		}
@@ -177,6 +178,33 @@ func (l *Lock) Lock(opts LockOptions) (UnlockFunc, error) {
 		return l.unlock(ctx, opts.GoroutineID)
 	}
 	return unlocker, nil
+}
+
+func (l *Lock) Abandon(ctx context.Context) error {
+	unlockStateMutex := lockMutex(&l.stateMutex)
+	defer unlockStateMutex()
+
+	if l.lockedAccordingToInternalState() {
+		refresherGeneration := l.refresherGeneration
+		waiter := l.shutdownRefresherGoroutine()
+		l.owner = ""
+		l.metageneration = 0
+		unlockStateMutex()
+
+		l.logDebug("Abandoning locked lock")
+		select {
+		case <-waiter.Done():
+			// Do nothing
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		l.logDebug("Done abandoning locked lock. refresher_generation=%s", refresherGeneration)
+	} else {
+		unlockStateMutex()
+		l.logDebug("Abandoning unlocked lock")
+	}
+
+	return nil
 }
 
 func (l *Lock) unlock(ctx context.Context, goroutineID uint64) (deleted bool, err error) {

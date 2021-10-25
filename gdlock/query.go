@@ -1,9 +1,11 @@
 package gdlock
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -19,6 +21,47 @@ func (l *Lock) OwnedAccordingToInternalState(goroutineID uint64) bool {
 	l.stateMutex.Lock()
 	defer l.stateMutex.Unlock()
 	return l.ownedAccordingToInternalState(goroutineID)
+}
+
+func (l *Lock) LockedAccordingToServer(ctx context.Context) (bool, error) {
+	attrs, err := l.bucket.Object(l.config.Path).Attrs(ctx)
+	if err != nil {
+		return attrs != nil, nil
+	} else if err == storage.ErrObjectNotExist {
+		return false, nil
+	} else {
+		return false, err
+	}
+}
+
+func (l *Lock) OwnedAccordingToServer(ctx context.Context, goroutineID uint64) (bool, error) {
+	attrs, err := l.bucket.Object(l.config.Path).Attrs(ctx)
+	if err != nil {
+		if attrs == nil {
+			return false, nil
+		} else {
+			return attrs.Metadata["identity"] == l.identity(goroutineID), nil
+		}
+	} else if err == storage.ErrObjectNotExist {
+		return false, nil
+	} else {
+		return false, err
+	}
+}
+
+func (l *Lock) Healthy() (bool, error) {
+	l.stateMutex.Lock()
+	defer l.stateMutex.Unlock()
+	if !l.lockedAccordingToInternalState() {
+		return false, ErrNotLocked
+	}
+	return atomic.LoadUint32(l.refresherLiveState) == 1, nil
+}
+
+func (l *Lock) LastRefreshError() error {
+	l.stateMutex.Lock()
+	defer l.stateMutex.Unlock()
+	return l.refresherError
 }
 
 func (l *Lock) lockedAccordingToInternalState() bool {
