@@ -1,12 +1,15 @@
 package gdlock
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/FooBarWidget/distributed-lock-google-cloud-storage-go/log"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/thanhpk/randstr"
@@ -14,19 +17,21 @@ import (
 	"google.golang.org/api/option"
 )
 
-var _ = FDescribe("Lock", func() {
+var _ = Describe("Lock", func() {
 	const (
 		GoroutineID1 = 10
 		GoroutineID2 = 20
 	)
 
 	var (
-		lockPath = fmt.Sprintf("go-lock.%s.%d", randstr.Hex(16), os.Getpid())
-
-		ctx         context.Context
-		cancelCtx   context.CancelFunc
-		lock, lock2 *Lock
-		err         error
+		lockPath               string
+		ctx                    context.Context
+		cancelCtx              context.CancelFunc
+		logOutput1, logOutput2 bytes.Buffer
+		logger1, logger2       log.Logger
+		loggerMutex            sync.Mutex
+		lock, lock2            *Lock
+		err                    error
 	)
 
 	requireEnvvar := func(name string) string {
@@ -41,6 +46,8 @@ var _ = FDescribe("Lock", func() {
 		var config = DefaultConfig
 		config.BucketName = requireEnvvar("TEST_GCLOUD_BUCKET")
 		config.Path = lockPath
+		config.Logger = &logger1
+		config.LoggerMutex = &loggerMutex
 		config.ClientOptions = []option.ClientOption{option.WithCredentialsFile(requireEnvvar("TEST_GCLOUD_CREDENTIALS_PATH"))}
 		return config
 	}
@@ -52,19 +59,52 @@ var _ = FDescribe("Lock", func() {
 	}
 
 	forceEraseLockObject := func() {
-		writer := gcloudBucket().Object(lockPath).NewWriter(ctx)
-		writer.ObjectAttrs.CacheControl = "no-store"
-		err = writer.Close()
-		Expect(err).ToNot(HaveOccurred())
+		err = gcloudBucket().Object(lockPath).Delete(ctx)
+		Expect(err).To(
+			Or(
+				Not(HaveOccurred()),
+				MatchError(storage.ErrObjectNotExist),
+			),
+		)
 	}
 
+	BeforeSuite(func() {
+		lockPath = fmt.Sprintf("go-lock.%s.%d.%d", randstr.Hex(16), os.Getpid(), GinkgoParallelNode())
+	})
+
 	BeforeEach(func() {
-		ctx, cancelCtx = context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancelCtx = context.WithTimeout(context.Background(), 25*time.Second)
+		logOutput1 = bytes.Buffer{}
+		logOutput2 = bytes.Buffer{}
+		logger1 = log.NewLogger(&logOutput1)
+		logger1.SetLevel(log.Debug)
+		logger2 = log.NewLogger(&logOutput2)
+		logger2.SetLevel(log.Debug)
+		loggerMutex = sync.Mutex{}
 	})
 
 	AfterEach(func() {
 		if cancelCtx != nil {
 			cancelCtx()
+		}
+		if CurrentGinkgoTestDescription().Failed {
+			loggerMutex.Lock()
+			defer loggerMutex.Unlock()
+			if logOutput1.Len() > 0 || logOutput2.Len() > 0 {
+				fmt.Fprintf(os.Stderr, "\n----------- Diagnostics for test: %s ----------\n", CurrentGinkgoTestDescription().FullTestText)
+				if logOutput1.Len() > 0 {
+					fmt.Fprintln(os.Stderr, "Lock debug logs 1:")
+					fmt.Fprintln(os.Stderr, logOutput1.String())
+				}
+				if logOutput1.Len() > 0 && logOutput2.Len() > 0 {
+					fmt.Fprint(os.Stderr, "\n\n")
+				}
+				if logOutput2.Len() > 0 {
+					fmt.Fprintln(os.Stderr, "Lock debug logs 2:")
+					fmt.Fprintln(os.Stderr, logOutput2.String())
+				}
+				fmt.Fprintln(os.Stderr, "---------------------")
+			}
 		}
 	})
 
@@ -113,7 +153,7 @@ var _ = FDescribe("Lock", func() {
 			}
 		})
 
-		It("works", func() {
+		FIt("works", func() {
 			forceEraseLockObject()
 			lock, err = New(ctx, defaultConfig())
 			Expect(err).ToNot(HaveOccurred())

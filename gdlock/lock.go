@@ -114,14 +114,13 @@ func (l *Lock) Lock(opts LockOptions) (UnlockFunc, error) {
 	}
 
 	var (
-		file  *storage.ObjectHandle
 		attrs *storage.ObjectAttrs
 		err   error
 	)
 	var retryOpts = retryOptions{
 		Context: opts.Context,
 		RetryLogger: func(sleepDuration time.Duration) {
-			l.logInfo("Unable to acquire lock. Will try again in %.1f seconds", sleepDuration)
+			l.logInfo("Unable to acquire lock. Will try again in %s", sleepDuration.String())
 		},
 		BackoffMin:        l.config.BackoffMin,
 		BackoffMax:        l.config.BackoffMax,
@@ -129,12 +128,24 @@ func (l *Lock) Lock(opts LockOptions) (UnlockFunc, error) {
 	}
 
 	err = retryWithBackoffUntilSuccess(retryOpts, func() (tryResult, error) {
+		var file *storage.ObjectHandle
+
 		l.logDebug("Acquiring lock")
 		file, err = l.createLockObject(opts.Context, opts.GoroutineID)
 		if err != nil {
-			return tryResultNone, err
+			return tryResultNone, fmt.Errorf("error creating lock object: %w", err)
 		}
 		if file != nil {
+			l.logDebug("Created lock object. Querying object attributes")
+			attrs, err = l.bucket.Object(l.config.Path).Attrs(opts.Context)
+			if (err == nil && attrs == nil) || errors.Is(err, storage.ErrObjectNotExist) {
+				l.logWarn("Lock was deleted right after having created it. Retrying.")
+				return tryResultRetryImmediately, nil
+			}
+			if err != nil {
+				return tryResultNone, fmt.Errorf("error querying lock object attributes: %w", err)
+			}
+
 			l.logDebug("Successfully acquired lock")
 			return tryResultSuccess, nil
 		}
@@ -142,25 +153,29 @@ func (l *Lock) Lock(opts LockOptions) (UnlockFunc, error) {
 		l.logDebug("Error acquiring lock. Investigating why...")
 		file = l.bucket.Object(l.config.Path)
 		attrs, err = file.Attrs(opts.Context)
-		if (err != nil && attrs == nil) || err == storage.ErrObjectNotExist {
+		if (err == nil && attrs == nil) || errors.Is(err, storage.ErrObjectNotExist) {
 			l.logWarn("Lock was deleted right after having created it. Retrying.")
 			return tryResultRetryImmediately, nil
 		}
 		if err != nil {
-			return tryResultNone, err
+			return tryResultNone, fmt.Errorf("error querying lock object attributes: %w", err)
 		}
 
 		if attrs.Metadata["identity"] == l.identity(opts.GoroutineID) {
 			l.logWarn("Lock was already owned by this instance, but was abandoned. Resetting lock")
 			_, err = l.deleteLockObject(opts.Context, attrs.Metageneration)
-			return tryResultRetryImmediately, err
+			if err == nil {
+				return tryResultRetryImmediately, nil
+			} else {
+				return tryResultNone, fmt.Errorf("error deleting lock object: %w", err)
+			}
 		}
 
 		if l.isLockStale(attrs) {
 			l.logWarn("Lock is stale. Resetting lock")
 			_, err = l.deleteLockObject(opts.Context, attrs.Metageneration)
 			if err != nil {
-				return tryResultNone, err
+				return tryResultNone, fmt.Errorf("error deleting lock object: %w", err)
 			}
 		} else {
 			l.logDebug("Lock was already acquired, and is not stale")
